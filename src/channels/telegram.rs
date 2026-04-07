@@ -472,6 +472,29 @@ impl TelegramChannel {
         Some((chat_id, message_id))
     }
 
+    fn extract_media_group_id(update: &serde_json::Value) -> Option<&str> {
+        update
+            .get("message")
+            .and_then(|message| message.get("media_group_id"))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    fn merge_media_group_messages(
+        media_group_id: &str,
+        mut messages: Vec<ChannelMessage>,
+    ) -> Option<ChannelMessage> {
+        let mut merged = messages.drain(..1).next()?;
+        let mut contents = vec![merged.content.clone()];
+        for msg in messages {
+            if !msg.content.trim().is_empty() {
+                contents.push(msg.content);
+            }
+        }
+        merged.id = format!("{}_group_{media_group_id}", merged.id);
+        merged.content = contents.join("\n\n");
+        Some(merged)
+    }
+
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
@@ -2910,7 +2933,77 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
 
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
-                for update in results {
+                let mut index = 0usize;
+                while index < results.len() {
+                    let update = &results[index];
+
+                    if let Some(media_group_id) = Self::extract_media_group_id(update) {
+                        let mut grouped_messages = Vec::new();
+                        let mut reaction_target = None;
+                        let mut group_index = index;
+
+                        while group_index < results.len() {
+                            let group_update = &results[group_index];
+                            if Self::extract_media_group_id(group_update) != Some(media_group_id) {
+                                break;
+                            }
+
+                            if let Some(uid) = group_update
+                                .get("update_id")
+                                .and_then(serde_json::Value::as_i64)
+                            {
+                                offset = uid + 1;
+                            }
+
+                            if reaction_target.is_none() {
+                                reaction_target = Self::extract_update_message_target(group_update);
+                            }
+
+                            if let Some(msg) = self.try_parse_attachment_message(group_update).await
+                            {
+                                grouped_messages.push(msg);
+                            } else {
+                                Box::pin(self.handle_unauthorized_message(group_update)).await;
+                            }
+
+                            group_index += 1;
+                        }
+
+                        index = group_index;
+
+                        let Some(msg) =
+                            Self::merge_media_group_messages(media_group_id, grouped_messages)
+                        else {
+                            continue;
+                        };
+
+                        if self.ack_reactions {
+                            if let Some((reaction_chat_id, reaction_message_id)) = reaction_target {
+                                self.try_add_ack_reaction_nonblocking(
+                                    reaction_chat_id,
+                                    reaction_message_id,
+                                );
+                            }
+                        }
+
+                        // Send "typing" indicator immediately when we receive a message
+                        let typing_body = serde_json::json!({
+                            "chat_id": &msg.reply_target,
+                            "action": "typing"
+                        });
+                        let _ = self
+                            .http_client()
+                            .post(self.api_url("sendChatAction"))
+                            .json(&typing_body)
+                            .send()
+                            .await; // Ignore errors for typing indicator
+
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+
                     // Advance offset past this update
                     if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
@@ -2924,6 +3017,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                         m
                     } else {
                         Box::pin(self.handle_unauthorized_message(update)).await;
+                        index += 1;
                         continue;
                     };
 
@@ -2953,6 +3047,8 @@ Ensure only one `zeroclaw` process is using this bot token."
                     if tx.send(msg).await.is_err() {
                         return Ok(());
                     }
+
+                    index += 1;
                 }
             }
         }
@@ -3052,6 +3148,54 @@ mod tests {
 
         let target = TelegramChannel::extract_update_message_target(&update);
         assert_eq!(target, Some(("-100123456".to_string(), 99)));
+    }
+
+    #[test]
+    fn telegram_extract_media_group_id_parses_value() {
+        let update = serde_json::json!({
+            "update_id": 12,
+            "message": {
+                "media_group_id": "album-123"
+            }
+        });
+
+        assert_eq!(
+            TelegramChannel::extract_media_group_id(&update),
+            Some("album-123")
+        );
+    }
+
+    #[test]
+    fn telegram_merge_media_group_messages_combines_attachment_contents() {
+        let make_msg = |id: &str, content: &str| ChannelMessage {
+            id: id.to_string(),
+            sender: "alice".to_string(),
+            reply_target: "-1001".to_string(),
+            content: content.to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        let merged = TelegramChannel::merge_media_group_messages(
+            "album-xyz",
+            vec![
+                make_msg(
+                    "telegram_-1001_10",
+                    "[IMAGE:/tmp/workspace/photo_1.jpg]\n\nFirst caption",
+                ),
+                make_msg("telegram_-1001_11", "[IMAGE:/tmp/workspace/photo_2.jpg]"),
+            ],
+        )
+        .expect("expected merged media group message");
+
+        assert!(merged.id.ends_with("_group_album-xyz"));
+        assert_eq!(
+            merged.content,
+            "[IMAGE:/tmp/workspace/photo_1.jpg]\n\nFirst caption\n\n[IMAGE:/tmp/workspace/photo_2.jpg]"
+        );
     }
 
     #[test]
