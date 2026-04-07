@@ -481,16 +481,23 @@ impl TelegramChannel {
 
     fn merge_media_group_messages(
         media_group_id: &str,
-        mut messages: Vec<ChannelMessage>,
+        messages: Vec<ChannelMessage>,
     ) -> Option<ChannelMessage> {
-        let mut merged = messages.drain(..1).next()?;
-        let mut contents = vec![merged.content.clone()];
+        let mut messages = messages.into_iter();
+        let mut merged = messages.next()?;
+        let mut contents = Vec::new();
+        if !merged.content.trim().is_empty() {
+            contents.push(std::mem::take(&mut merged.content));
+        }
         for msg in messages {
             if !msg.content.trim().is_empty() {
                 contents.push(msg.content);
             }
         }
-        merged.id = format!("{}_group_{media_group_id}", merged.id);
+        if contents.is_empty() {
+            return None;
+        }
+        merged.id = format!("{}:group:{media_group_id}", merged.id);
         merged.content = contents.join("\n\n");
         Some(merged)
     }
@@ -2933,17 +2940,24 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
 
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
-                let mut index = 0usize;
-                while index < results.len() {
-                    let update = &results[index];
+                // Manual index loop is required so we can consume an entire
+                // contiguous Telegram `media_group_id` block in one pass and
+                // skip those already-aggregated updates.
+                //
+                // NOTE: This relies on Telegram getUpdates returning updates
+                // for the same media_group_id contiguously within a poll batch.
+                let mut update_index = 0usize;
+                while update_index < results.len() {
+                    let update = &results[update_index];
 
                     if let Some(media_group_id) = Self::extract_media_group_id(update) {
                         let mut grouped_messages = Vec::new();
                         let mut reaction_target = None;
-                        let mut group_index = index;
+                        let mut group_scan_index = update_index;
+                        let mut group_parse_failed = false;
 
-                        while group_index < results.len() {
-                            let group_update = &results[group_index];
+                        while group_scan_index < results.len() {
+                            let group_update = &results[group_scan_index];
                             if Self::extract_media_group_id(group_update) != Some(media_group_id) {
                                 break;
                             }
@@ -2963,17 +2977,52 @@ Ensure only one `zeroclaw` process is using this bot token."
                             {
                                 grouped_messages.push(msg);
                             } else {
-                                Box::pin(self.handle_unauthorized_message(group_update)).await;
+                                group_parse_failed = true;
+                                // Keep established behavior for unhandled updates:
+                                // this helper no-ops for non-text/non-unauthorized
+                                // cases, and emits guidance for unauthorized senders.
+                                self.handle_unauthorized_message(group_update).await;
+                                group_scan_index += 1;
+                                // Short-circuit attachment parsing for the rest of this
+                                // media_group_id; we'll drop the whole group below.
+                                while group_scan_index < results.len() {
+                                    let next_update = &results[group_scan_index];
+                                    if Self::extract_media_group_id(next_update)
+                                        != Some(media_group_id)
+                                    {
+                                        break;
+                                    }
+                                    if let Some(uid) = next_update
+                                        .get("update_id")
+                                        .and_then(serde_json::Value::as_i64)
+                                    {
+                                        offset = uid + 1;
+                                    }
+                                    group_scan_index += 1;
+                                }
+                                break;
                             }
 
-                            group_index += 1;
+                            group_scan_index += 1;
                         }
 
-                        index = group_index;
+                        update_index = group_scan_index;
+
+                        if group_parse_failed {
+                            tracing::warn!(
+                                media_group_id,
+                                "Skipping Telegram media group due to at least one unparseable attachment update"
+                            );
+                            continue;
+                        }
 
                         let Some(msg) =
                             Self::merge_media_group_messages(media_group_id, grouped_messages)
                         else {
+                            tracing::warn!(
+                                media_group_id,
+                                "Skipping Telegram media group: no mergeable attachment content"
+                            );
                             continue;
                         };
 
@@ -3010,45 +3059,46 @@ Ensure only one `zeroclaw` process is using this bot token."
                     }
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
-                        m
+                        Some(m)
                     } else if let Some(m) = self.try_parse_voice_message(update).await {
-                        m
+                        Some(m)
                     } else if let Some(m) = self.try_parse_attachment_message(update).await {
-                        m
+                        Some(m)
                     } else {
                         Box::pin(self.handle_unauthorized_message(update)).await;
-                        index += 1;
-                        continue;
+                        None
                     };
 
-                    if self.ack_reactions {
-                        if let Some((reaction_chat_id, reaction_message_id)) =
-                            Self::extract_update_message_target(update)
-                        {
-                            self.try_add_ack_reaction_nonblocking(
-                                reaction_chat_id,
-                                reaction_message_id,
-                            );
+                    if let Some(msg) = msg {
+                        if self.ack_reactions {
+                            if let Some((reaction_chat_id, reaction_message_id)) =
+                                Self::extract_update_message_target(update)
+                            {
+                                self.try_add_ack_reaction_nonblocking(
+                                    reaction_chat_id,
+                                    reaction_message_id,
+                                );
+                            }
+                        }
+
+                        // Send "typing" indicator immediately when we receive a message
+                        let typing_body = serde_json::json!({
+                            "chat_id": &msg.reply_target,
+                            "action": "typing"
+                        });
+                        let _ = self
+                            .http_client()
+                            .post(self.api_url("sendChatAction"))
+                            .json(&typing_body)
+                            .send()
+                            .await; // Ignore errors for typing indicator
+
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
                         }
                     }
 
-                    // Send "typing" indicator immediately when we receive a message
-                    let typing_body = serde_json::json!({
-                        "chat_id": &msg.reply_target,
-                        "action": "typing"
-                    });
-                    let _ = self
-                        .http_client()
-                        .post(self.api_url("sendChatAction"))
-                        .json(&typing_body)
-                        .send()
-                        .await; // Ignore errors for typing indicator
-
-                    if tx.send(msg).await.is_err() {
-                        return Ok(());
-                    }
-
-                    index += 1;
+                    update_index += 1;
                 }
             }
         }
@@ -3167,7 +3217,7 @@ mod tests {
 
     #[test]
     fn telegram_merge_media_group_messages_combines_attachment_contents() {
-        let make_msg = |id: &str, content: &str| ChannelMessage {
+        let msg = |id: &str, content: &str| ChannelMessage {
             id: id.to_string(),
             sender: "alice".to_string(),
             reply_target: "-1001".to_string(),
@@ -3182,16 +3232,16 @@ mod tests {
         let merged = TelegramChannel::merge_media_group_messages(
             "album-xyz",
             vec![
-                make_msg(
+                msg(
                     "telegram_-1001_10",
                     "[IMAGE:/tmp/workspace/photo_1.jpg]\n\nFirst caption",
                 ),
-                make_msg("telegram_-1001_11", "[IMAGE:/tmp/workspace/photo_2.jpg]"),
+                msg("telegram_-1001_11", "[IMAGE:/tmp/workspace/photo_2.jpg]"),
             ],
         )
         .expect("expected merged media group message");
 
-        assert!(merged.id.ends_with("_group_album-xyz"));
+        assert!(merged.id.ends_with(":group:album-xyz"));
         assert_eq!(
             merged.content,
             "[IMAGE:/tmp/workspace/photo_1.jpg]\n\nFirst caption\n\n[IMAGE:/tmp/workspace/photo_2.jpg]"
