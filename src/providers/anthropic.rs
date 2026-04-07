@@ -1957,9 +1957,8 @@ mod tests {
     fn convert_messages_with_multiple_image_markers_without_text() {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content:
-                "[IMAGE:data:image/png;base64,AAAA]\n[IMAGE:data:image/jpeg;base64,BBBB]"
-                    .to_string(),
+            content: "[IMAGE:data:image/png;base64,AAAA]\n[IMAGE:data:image/jpeg;base64,BBBB]"
+                .to_string(),
         }];
 
         let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);

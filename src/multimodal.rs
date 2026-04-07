@@ -203,7 +203,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
 
             let drop_here = to_drop.min(refs.len());
             to_drop = to_drop.saturating_sub(drop_here);
-            let kept_refs: Vec<String> = refs.into_iter().skip(drop_here).collect();
+            let kept_refs = &refs[drop_here..];
 
             let content = if kept_refs.is_empty() {
                 if cleaned.trim().is_empty() {
@@ -212,7 +212,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
                     cleaned
                 }
             } else {
-                compose_multimodal_message(&cleaned, &kept_refs)
+                compose_multimodal_message(&cleaned, kept_refs)
             };
 
             ChatMessage {

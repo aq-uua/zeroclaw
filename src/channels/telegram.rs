@@ -2946,6 +2946,8 @@ Ensure only one `zeroclaw` process is using this bot token."
                 //
                 // NOTE: This relies on Telegram getUpdates returning updates
                 // for the same media_group_id contiguously within a poll batch.
+                // If Telegram ever returns a split/non-contiguous group, each
+                // segment would be handled independently (multiple turns).
                 let mut update_index = 0usize;
                 while update_index < results.len() {
                     let update = &results[update_index];
@@ -2984,7 +2986,8 @@ Ensure only one `zeroclaw` process is using this bot token."
                                 self.handle_unauthorized_message(group_update).await;
                                 group_scan_index += 1;
                                 // Short-circuit attachment parsing for the rest of this
-                                // media_group_id; we'll drop the whole group below.
+                                // media_group_id; the outer branch then skips
+                                // dispatch for this whole group.
                                 while group_scan_index < results.len() {
                                     let next_update = &results[group_scan_index];
                                     if Self::extract_media_group_id(next_update)
