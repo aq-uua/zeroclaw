@@ -3249,6 +3249,36 @@ mod tests {
     }
 
     #[test]
+    fn telegram_merge_media_group_messages_without_caption_keeps_all_images() {
+        let msg = |id: &str, content: &str| ChannelMessage {
+            id: id.to_string(),
+            sender: "alice".to_string(),
+            reply_target: "-1001".to_string(),
+            content: content.to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        let merged = TelegramChannel::merge_media_group_messages(
+            "album-abc",
+            vec![
+                msg("telegram_-1001_10", "[IMAGE:/tmp/workspace/photo_1.jpg]"),
+                msg("telegram_-1001_11", "[IMAGE:/tmp/workspace/photo_2.jpg]"),
+            ],
+        )
+        .expect("expected merged media group message");
+
+        assert!(merged.id.ends_with(":group:album-abc"));
+        assert_eq!(
+            merged.content,
+            "[IMAGE:/tmp/workspace/photo_1.jpg]\n\n[IMAGE:/tmp/workspace/photo_2.jpg]"
+        );
+    }
+
+    #[test]
     fn typing_handle_starts_as_none() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
         let guard = ch.typing_handle.lock();

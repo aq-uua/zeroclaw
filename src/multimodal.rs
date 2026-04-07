@@ -178,48 +178,46 @@ pub async fn prepare_messages_for_provider(
 /// Strip image markers from older messages (oldest first) until total image
 /// count is within `max_images`. Keeps the text content of each message.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
-    // Find which messages (by index) contain images, oldest first.
-    let image_positions: Vec<(usize, usize)> = messages
+    let total_images: usize = messages
         .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == "user")
-        .filter_map(|(i, m)| {
-            let count = parse_image_markers(&m.content).1.len();
-            if count > 0 { Some((i, count)) } else { None }
-        })
-        .collect();
+        .filter(|m| m.role == "user")
+        .map(|m| parse_image_markers(&m.content).1.len())
+        .sum();
 
-    // Determine how many images to drop (from the oldest messages).
-    let total: usize = image_positions.iter().map(|(_, c)| c).sum();
-    let mut to_drop = total.saturating_sub(max_images);
-
-    // Collect indices of messages whose images should be stripped.
-    let mut strip_indices = std::collections::HashSet::new();
-    for &(idx, count) in &image_positions {
-        if to_drop == 0 {
-            break;
-        }
-        strip_indices.insert(idx);
-        to_drop = to_drop.saturating_sub(count);
+    let mut to_drop = total_images.saturating_sub(max_images);
+    if to_drop == 0 {
+        return messages.to_vec();
     }
 
     messages
         .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            if strip_indices.contains(&i) {
-                let (cleaned, _) = parse_image_markers(&m.content);
-                let text = if cleaned.trim().is_empty() {
+        .map(|message| {
+            if message.role != "user" || to_drop == 0 {
+                return message.clone();
+            }
+
+            let (cleaned, refs) = parse_image_markers(&message.content);
+            if refs.is_empty() {
+                return message.clone();
+            }
+
+            let drop_here = to_drop.min(refs.len());
+            to_drop = to_drop.saturating_sub(drop_here);
+            let kept_refs: Vec<String> = refs.into_iter().skip(drop_here).collect();
+
+            let content = if kept_refs.is_empty() {
+                if cleaned.trim().is_empty() {
                     "[image removed from history]".to_string()
                 } else {
                     cleaned
-                };
-                ChatMessage {
-                    role: m.role.clone(),
-                    content: text,
                 }
             } else {
-                m.clone()
+                compose_multimodal_message(&cleaned, &kept_refs)
+            };
+
+            ChatMessage {
+                role: message.role.clone(),
+                content,
             }
         })
         .collect()
@@ -593,9 +591,7 @@ mod tests {
     #[test]
     fn trim_old_images_multi_image_message_stripped_as_unit() {
         // A single message has 3 images. We need to drop 2 to reach max=1.
-        // But trimming works at message granularity — the entire message gets
-        // stripped (all 3 images removed), which over-trims to 0. The newest
-        // message (text-only) is untouched.
+        // Trimming should now drop only the oldest 2 markers and keep the newest.
         let messages = vec![
             ChatMessage::user(
                 "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
@@ -606,12 +602,41 @@ mod tests {
 
         let trimmed = trim_old_images(&messages, 1);
         assert_eq!(trimmed.len(), 2);
-        // All images in the first message are gone, but text remains
+        // Oldest two images should be removed; newest should remain.
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty());
+        assert_eq!(refs0, vec!["/tmp/c.png".to_string()]);
         assert!(trimmed[0].content.contains("Three pics"));
         // Second message unchanged
         assert_eq!(trimmed[1].content, "Just text, no images");
+    }
+
+    #[test]
+    fn trim_old_images_single_message_without_text_keeps_newest_markers() {
+        let messages = vec![ChatMessage::user(
+            "[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]\n[IMAGE:/tmp/3.png]".to_string(),
+        )];
+
+        let trimmed = trim_old_images(&messages, 2);
+        let (_, refs) = parse_image_markers(&trimmed[0].content);
+        assert_eq!(
+            refs,
+            vec!["/tmp/2.png".to_string(), "/tmp/3.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn trim_old_images_single_message_with_text_keeps_newest_markers() {
+        let messages = vec![ChatMessage::user(
+            "Batch\n[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]\n[IMAGE:/tmp/3.png]".to_string(),
+        )];
+
+        let trimmed = trim_old_images(&messages, 2);
+        let (text, refs) = parse_image_markers(&trimmed[0].content);
+        assert!(text.contains("Batch"));
+        assert_eq!(
+            refs,
+            vec!["/tmp/2.png".to_string(), "/tmp/3.png".to_string()]
+        );
     }
 
     #[test]

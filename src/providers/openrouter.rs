@@ -1005,6 +1005,21 @@ mod tests {
     }
 
     #[test]
+    fn to_message_content_converts_multiple_image_markers_without_text() {
+        let content = "[IMAGE:data:image/png;base64,aQ==]\n[IMAGE:data:image/jpeg;base64,bQ==]";
+        let value =
+            serde_json::to_value(OpenRouterProvider::to_message_content("user", content)).unwrap();
+        let parts = value
+            .as_array()
+            .expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,aQ==");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,bQ==");
+    }
+
+    #[test]
     fn native_response_parses_usage() {
         let json = r#"{
             "choices": [{"message": {"content": "Hello"}}],
