@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -192,6 +193,49 @@ fn format_attachment_content(
 
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
+}
+
+fn trim_url_token(token: &str) -> &str {
+    token.trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
+                    | '!'
+                    | '?'
+            )
+    })
+}
+
+fn extract_http_urls_from_text(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let candidate = trim_url_token(token);
+            if is_http_url(candidate) {
+                Some(candidate.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn append_embedded_image_markers(content: String, image_urls: &[String]) -> String {
+    if image_urls.is_empty() {
+        return content;
+    }
+
+    let markers = image_urls
+        .iter()
+        .map(|url| format!("[IMAGE:{url}]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if content.trim().is_empty() {
+        markers
+    } else {
+        format!("{content}\n\n{markers}")
+    }
 }
 
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
@@ -790,6 +834,60 @@ impl TelegramChannel {
         (!normalized.is_empty()).then_some(normalized)
     }
 
+    fn is_embedded_image_url(url: &str) -> bool {
+        matches!(
+            infer_attachment_kind_from_target(url),
+            Some(TelegramAttachmentKind::Image)
+        )
+    }
+
+    fn extract_embedded_image_urls(message: &serde_json::Value, text: &str) -> Vec<String> {
+        let mut image_urls = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut push_if_image = |url: &str| {
+            let trimmed = trim_url_token(url);
+            if !Self::is_embedded_image_url(trimmed) {
+                return;
+            }
+            if seen.insert(trimmed.to_string()) {
+                image_urls.push(trimmed.to_string());
+            }
+        };
+
+        for key in ["entities", "caption_entities"] {
+            let Some(entities) = message.get(key).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for entity in entities {
+                let Some(entity_type) = entity.get("type").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if entity_type != "text_link" {
+                    continue;
+                }
+                if let Some(url) = entity.get("url").and_then(serde_json::Value::as_str) {
+                    push_if_image(url);
+                }
+            }
+        }
+
+        if let Some(url) = message
+            .get("link_preview_options")
+            .and_then(|opts| opts.get("url"))
+            .and_then(serde_json::Value::as_str)
+        {
+            push_if_image(url);
+        }
+
+        for url in extract_http_urls_from_text(text) {
+            push_if_image(&url);
+        }
+
+        image_urls
+    }
+
     fn is_group_message(message: &serde_json::Value) -> bool {
         message
             .get("chat")
@@ -1177,6 +1275,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 let _ = write!(content, "\n\n{caption}");
             }
         }
+        let embedded_image_urls =
+            Self::extract_embedded_image_urls(message, attachment.caption.as_deref().unwrap_or(""));
+        content = append_embedded_image_markers(content, &embedded_image_urls);
 
         // Prepend reply context if replying to another message
         if let Some(quote) = self.extract_reply_context(message) {
@@ -1498,13 +1599,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let mut content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
         } else {
             text.to_string()
         };
+        let embedded_image_urls = Self::extract_embedded_image_urls(message, &content);
+        content = append_embedded_image_markers(content, &embedded_image_urls);
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n{content}")
@@ -3653,6 +3756,90 @@ mod tests {
         assert_eq!(msg.reply_target, "-100200300:789");
         assert_eq!(msg.content, "hello from topic");
         assert_eq!(msg.id, "telegram_-100200300_42");
+    }
+
+    #[test]
+    fn extract_embedded_image_urls_reads_text_and_entities() {
+        let message = serde_json::json!({
+            "text": "See https://example.com/cat.png and docs",
+            "entities": [
+                {
+                    "type": "text_link",
+                    "offset": 0,
+                    "length": 4,
+                    "url": "https://example.com/hidden.jpg"
+                },
+                {
+                    "type": "text_link",
+                    "offset": 5,
+                    "length": 4,
+                    "url": "https://example.com/file.pdf"
+                }
+            ],
+            "link_preview_options": {
+                "url": "https://example.com/preview.webp"
+            }
+        });
+
+        let urls = TelegramChannel::extract_embedded_image_urls(
+            &message,
+            message["text"].as_str().unwrap(),
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/hidden.jpg".to_string(),
+                "https://example.com/preview.webp".to_string(),
+                "https://example.com/cat.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_embedded_image_urls_reads_caption_entities() {
+        let message = serde_json::json!({
+            "caption": "photo link",
+            "caption_entities": [{
+                "type": "text_link",
+                "offset": 0,
+                "length": 5,
+                "url": "https://example.com/album-image.jpeg"
+            }]
+        });
+
+        let urls = TelegramChannel::extract_embedded_image_urls(
+            &message,
+            message["caption"].as_str().unwrap(),
+        );
+        assert_eq!(urls, vec!["https://example.com/album-image.jpeg"]);
+    }
+
+    #[test]
+    fn parse_update_message_appends_embedded_image_markers() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 321,
+            "message": {
+                "message_id": 54,
+                "text": "please review",
+                "entities": [{
+                    "type": "text_link",
+                    "offset": 0,
+                    "length": 6,
+                    "url": "https://example.com/diagram.png"
+                }],
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999, "type": "private" }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("message with text_link should parse");
+        assert_eq!(
+            msg.content,
+            "please review\n\n[IMAGE:https://example.com/diagram.png]"
+        );
     }
 
     // ── File sending API URL tests ──────────────────────────────────

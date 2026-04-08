@@ -1,11 +1,10 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
@@ -134,22 +133,13 @@ impl DiscordChannel {
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// - `text/*` attachments are fetched and inlined as text blocks.
-/// - image attachments and embed images are fetched and appended as
-///   `[IMAGE:data:...]` markers so multimodal routing can batch them in one
-///   request.
-/// - other attachment types are skipped (audio is handled separately by
-///   transcription when configured).
+/// Only `text/*` MIME types are fetched and inlined. All other types are
+/// silently skipped. Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
-    embeds: &[serde_json::Value],
     client: &reqwest::Client,
 ) -> String {
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut image_markers: Vec<String> = Vec::new();
-    let mut seen_image_urls: HashSet<String> = HashSet::new();
-
-    let mut image_sources: Vec<(String, String, String)> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     for att in attachments {
         let ct = att
             .get("content_type")
@@ -163,19 +153,11 @@ async fn process_attachments(
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
-
-        if is_discord_image_attachment(ct, name) {
-            if seen_image_urls.insert(url.to_string()) {
-                image_sources.push((url.to_string(), ct.to_string(), name.to_string()));
-            }
-            continue;
-        }
-
         if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
-                        text_parts.push(format!("[{name}]\n{text}"));
+                        parts.push(format!("[{name}]\n{text}"));
                     }
                 }
                 Ok(resp) => {
@@ -193,29 +175,7 @@ async fn process_attachments(
             );
         }
     }
-
-    for embed_url in extract_embed_image_urls(embeds) {
-        if seen_image_urls.insert(embed_url.clone()) {
-            image_sources.push((embed_url, String::new(), "embed-image".to_string()));
-        }
-    }
-
-    for (url, content_type_hint, filename_hint) in image_sources {
-        if let Some(data_uri) =
-            fetch_image_data_uri(client, &url, &content_type_hint, &filename_hint).await
-        {
-            image_markers.push(format!("[IMAGE:{data_uri}]"));
-        }
-    }
-
-    let mut parts: Vec<String> = Vec::new();
-    if !text_parts.is_empty() {
-        parts.push(text_parts.join("\n---\n"));
-    }
-    if !image_markers.is_empty() {
-        parts.push(image_markers.join("\n"));
-    }
-    parts.join("\n")
+    parts.join("\n---\n")
 }
 
 /// Audio file extensions accepted for voice transcription.
@@ -232,116 +192,6 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
         return DISCORD_AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str());
     }
     false
-}
-
-/// Image file extensions accepted for multimodal marker extraction.
-const DISCORD_IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif",
-];
-
-fn image_mime_from_extension(filename: &str) -> Option<&'static str> {
-    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
-        "tif" | "tiff" => Some("image/tiff"),
-        "heic" => Some("image/heic"),
-        "heif" => Some("image/heif"),
-        _ => None,
-    }
-}
-
-fn normalize_image_mime(content_type: &str) -> Option<String> {
-    let mime = content_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if mime.starts_with("image/") && !mime.is_empty() {
-        Some(mime)
-    } else {
-        None
-    }
-}
-
-fn is_discord_image_attachment(content_type: &str, filename: &str) -> bool {
-    normalize_image_mime(content_type).is_some() || image_mime_from_extension(filename).is_some()
-}
-
-fn extract_embed_image_urls(embeds: &[serde_json::Value]) -> Vec<String> {
-    let mut urls = Vec::new();
-    let mut seen = HashSet::new();
-
-    for embed in embeds {
-        for key in ["image", "thumbnail"] {
-            let Some(obj) = embed.get(key) else {
-                continue;
-            };
-            for url_key in ["proxy_url", "url"] {
-                let Some(url) = obj.get(url_key).and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let trimmed = url.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if seen.insert(trimmed.to_string()) {
-                    urls.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    urls
-}
-
-async fn fetch_image_data_uri(
-    client: &reqwest::Client,
-    url: &str,
-    content_type_hint: &str,
-    filename_hint: &str,
-) -> Option<String> {
-    let response = match client.get(url).send().await {
-        Ok(resp) if resp.status().is_success() => resp,
-        Ok(resp) => {
-            tracing::warn!(url, status = %resp.status(), "discord image fetch failed");
-            return None;
-        }
-        Err(error) => {
-            tracing::warn!(url, error = %error, "discord image fetch error");
-            return None;
-        }
-    };
-
-    let response_content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(normalize_image_mime);
-
-    let bytes = match response.bytes().await {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::warn!(url, error = %error, "discord image read error");
-            return None;
-        }
-    };
-    if bytes.is_empty() {
-        tracing::warn!(url, "discord image fetch returned empty body");
-        return None;
-    }
-
-    let mime = response_content_type
-        .or_else(|| normalize_image_mime(content_type_hint))
-        .or_else(|| image_mime_from_extension(filename_hint).map(str::to_string))
-        .unwrap_or_else(|| "image/jpeg".to_string());
-
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Some(format!("data:{mime};base64,{b64}"))
 }
 
 /// Download and transcribe audio attachments from a Discord message.
@@ -1283,12 +1133,7 @@ impl Channel for DiscordChannel {
                             .cloned()
                             .unwrap_or_default();
                         let client = self.http_client();
-                        let embeds = d
-                            .get("embeds")
-                            .and_then(|value| value.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut text_parts = process_attachments(&atts, &embeds, &client).await;
+                        let mut text_parts = process_attachments(&atts, &client).await;
 
                         // Transcribe audio attachments when transcription is configured
                         if let Some(ref transcription_manager) = self.transcription_manager {
@@ -2374,7 +2219,7 @@ mod tests {
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
         let client = reqwest::Client::new();
-        let result = process_attachments(&[], &[], &client).await;
+        let result = process_attachments(&[], &client).await;
         assert!(result.is_empty());
     }
 
@@ -2386,97 +2231,8 @@ mod tests {
             "filename": "doc.pdf",
             "content_type": "application/pdf"
         })];
-        let result = process_attachments(&attachments, &[], &client).await;
+        let result = process_attachments(&attachments, &client).await;
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn extract_embed_image_urls_collects_proxy_and_image_urls() {
-        let embeds = vec![
-            serde_json::json!({
-                "image": {
-                    "proxy_url": "https://cdn.discordapp.com/image-proxy.png",
-                    "url": "https://example.com/image.png"
-                },
-                "thumbnail": {
-                    "url": "https://example.com/thumb.png"
-                }
-            }),
-            serde_json::json!({
-                "image": {
-                    "url": "https://example.com/image.png"
-                },
-                "thumbnail": {
-                    "proxy_url": "https://cdn.discordapp.com/thumb-proxy.png"
-                }
-            }),
-        ];
-
-        let urls = extract_embed_image_urls(&embeds);
-        assert_eq!(
-            urls,
-            vec![
-                "https://cdn.discordapp.com/image-proxy.png".to_string(),
-                "https://example.com/image.png".to_string(),
-                "https://example.com/thumb.png".to_string(),
-                "https://cdn.discordapp.com/thumb-proxy.png".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn is_discord_image_attachment_detects_by_mime_and_extension() {
-        assert!(is_discord_image_attachment("image/png", "ignored.bin"));
-        assert!(is_discord_image_attachment("", "photo.webp"));
-        assert!(!is_discord_image_attachment(
-            "application/pdf",
-            "report.pdf"
-        ));
-    }
-
-    #[tokio::test]
-    async fn process_attachments_embeds_and_images_batch_into_markers() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/attachment.png"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "image/png")
-                    .set_body_raw(vec![0x89, b'P', b'N', b'G'], "application/octet-stream"),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/embed.jpg"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "image/jpeg")
-                    .set_body_raw(vec![0xff, 0xd8, 0xff], "application/octet-stream"),
-            )
-            .mount(&server)
-            .await;
-
-        let attachments = vec![serde_json::json!({
-            "url": format!("{}/attachment.png", server.uri()),
-            "filename": "attachment.png",
-            "content_type": "image/png"
-        })];
-        let embeds = vec![serde_json::json!({
-            "image": {
-                "url": format!("{}/embed.jpg", server.uri())
-            }
-        })];
-
-        let client = reqwest::Client::new();
-        let rendered = process_attachments(&attachments, &embeds, &client).await;
-        let (text, refs) = crate::multimodal::parse_image_markers(&rendered);
-        assert!(text.is_empty());
-        assert_eq!(refs.len(), 2);
-        assert!(refs[0].starts_with("data:image/png;base64,"));
-        assert!(refs[1].starts_with("data:image/jpeg;base64,"));
     }
 
     #[test]
