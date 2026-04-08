@@ -2428,7 +2428,10 @@ mod tests {
     fn is_discord_image_attachment_detects_by_mime_and_extension() {
         assert!(is_discord_image_attachment("image/png", "ignored.bin"));
         assert!(is_discord_image_attachment("", "photo.webp"));
-        assert!(!is_discord_image_attachment("application/pdf", "report.pdf"));
+        assert!(!is_discord_image_attachment(
+            "application/pdf",
+            "report.pdf"
+        ));
     }
 
     #[tokio::test]
