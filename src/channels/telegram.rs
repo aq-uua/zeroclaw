@@ -212,6 +212,7 @@ fn trim_url_token(token: &str) -> &str {
                     | ','
                     | ';'
                     | ':'
+                    | '.'
                     | '!'
                     | '?'
             )
@@ -3823,6 +3824,19 @@ mod tests {
             message["caption"].as_str().unwrap(),
         );
         assert_eq!(urls, vec!["https://example.com/album-image.jpeg"]);
+    }
+
+    #[test]
+    fn extract_embedded_image_urls_trims_trailing_period_from_text_url() {
+        let message = serde_json::json!({
+            "text": "Look at this image https://example.com/cat.png."
+        });
+
+        let urls = TelegramChannel::extract_embedded_image_urls(
+            &message,
+            message["text"].as_str().unwrap(),
+        );
+        assert_eq!(urls, vec!["https://example.com/cat.png"]);
     }
 
     #[test]
