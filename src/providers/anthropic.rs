@@ -1954,6 +1954,33 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_with_multiple_image_markers_without_text() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "[IMAGE:data:image/png;base64,AAAA]\n[IMAGE:data:image/jpeg;base64,BBBB]"
+                .to_string(),
+        }];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 1);
+        assert_eq!(native_msgs[0].content.len(), 3);
+
+        match &native_msgs[0].content[0] {
+            NativeContentOut::Image { source } => assert_eq!(source.media_type, "image/png"),
+            _ => panic!("Expected first content block to be image/png"),
+        }
+        match &native_msgs[0].content[1] {
+            NativeContentOut::Image { source } => assert_eq!(source.media_type, "image/jpeg"),
+            _ => panic!("Expected second content block to be image/jpeg"),
+        }
+        match &native_msgs[0].content[2] {
+            NativeContentOut::Text { text, .. } => assert_eq!(text, "[image]"),
+            _ => panic!("Expected trailing placeholder text block"),
+        }
+    }
+
+    #[test]
     fn convert_messages_without_image_marker() {
         let messages = vec![ChatMessage {
             role: "user".to_string(),

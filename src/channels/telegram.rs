@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -192,6 +193,61 @@ fn format_attachment_content(
 
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
+}
+
+fn trim_url_token(token: &str) -> &str {
+    token.trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '.'
+                    | '!'
+                    | '?'
+            )
+    })
+}
+
+fn extract_http_urls_from_text(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let candidate = trim_url_token(token);
+            if is_http_url(candidate) {
+                Some(candidate.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn append_embedded_image_markers(content: String, image_urls: &[String]) -> String {
+    if image_urls.is_empty() {
+        return content;
+    }
+
+    let markers = image_urls
+        .iter()
+        .map(|url| format!("[IMAGE:{url}]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if content.trim().is_empty() {
+        markers
+    } else {
+        format!("{content}\n\n{markers}")
+    }
 }
 
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
@@ -470,6 +526,36 @@ impl TelegramChannel {
             .get("message_id")
             .and_then(serde_json::Value::as_i64)?;
         Some((chat_id, message_id))
+    }
+
+    fn extract_media_group_id(update: &serde_json::Value) -> Option<&str> {
+        update
+            .get("message")
+            .and_then(|message| message.get("media_group_id"))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    fn merge_media_group_messages(
+        media_group_id: &str,
+        messages: Vec<ChannelMessage>,
+    ) -> Option<ChannelMessage> {
+        let mut messages = messages.into_iter();
+        let mut merged = messages.next()?;
+        let mut contents = Vec::new();
+        if !merged.content.trim().is_empty() {
+            contents.push(std::mem::take(&mut merged.content));
+        }
+        for msg in messages {
+            if !msg.content.trim().is_empty() {
+                contents.push(msg.content);
+            }
+        }
+        if contents.is_empty() {
+            return None;
+        }
+        merged.id = format!("{}:group:{media_group_id}", merged.id);
+        merged.content = contents.join("\n\n");
+        Some(merged)
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
@@ -758,6 +844,60 @@ impl TelegramChannel {
 
         let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
         (!normalized.is_empty()).then_some(normalized)
+    }
+
+    fn is_embedded_image_url(url: &str) -> bool {
+        matches!(
+            infer_attachment_kind_from_target(url),
+            Some(TelegramAttachmentKind::Image)
+        )
+    }
+
+    fn extract_embedded_image_urls(message: &serde_json::Value, text: &str) -> Vec<String> {
+        let mut image_urls = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut push_if_image = |url: &str| {
+            let trimmed = trim_url_token(url);
+            if !Self::is_embedded_image_url(trimmed) {
+                return;
+            }
+            if seen.insert(trimmed.to_string()) {
+                image_urls.push(trimmed.to_string());
+            }
+        };
+
+        for key in ["entities", "caption_entities"] {
+            let Some(entities) = message.get(key).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for entity in entities {
+                let Some(entity_type) = entity.get("type").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if entity_type != "text_link" {
+                    continue;
+                }
+                if let Some(url) = entity.get("url").and_then(serde_json::Value::as_str) {
+                    push_if_image(url);
+                }
+            }
+        }
+
+        if let Some(url) = message
+            .get("link_preview_options")
+            .and_then(|opts| opts.get("url"))
+            .and_then(serde_json::Value::as_str)
+        {
+            push_if_image(url);
+        }
+
+        for url in extract_http_urls_from_text(text) {
+            push_if_image(&url);
+        }
+
+        image_urls
     }
 
     fn is_group_message(message: &serde_json::Value) -> bool {
@@ -1147,6 +1287,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 let _ = write!(content, "\n\n{caption}");
             }
         }
+        let embedded_image_urls =
+            Self::extract_embedded_image_urls(message, attachment.caption.as_deref().unwrap_or(""));
+        content = append_embedded_image_markers(content, &embedded_image_urls);
 
         // Prepend reply context if replying to another message
         if let Some(quote) = self.extract_reply_context(message) {
@@ -1468,13 +1611,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let mut content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
         } else {
             text.to_string()
         };
+        let embedded_image_urls = Self::extract_embedded_image_urls(message, &content);
+        content = append_embedded_image_markers(content, &embedded_image_urls);
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n{content}")
@@ -2910,49 +3055,168 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
 
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
-                for update in results {
+                // Manual index loop is required so we can consume an entire
+                // contiguous Telegram `media_group_id` block in one pass and
+                // skip those already-aggregated updates.
+                //
+                // NOTE: This relies on Telegram getUpdates returning updates
+                // for the same media_group_id contiguously within a poll batch.
+                // If Telegram ever returns a split/non-contiguous group, each
+                // segment would be handled independently (multiple turns).
+                let mut update_index = 0usize;
+                while update_index < results.len() {
+                    let update = &results[update_index];
+
+                    if let Some(media_group_id) = Self::extract_media_group_id(update) {
+                        let mut grouped_messages = Vec::new();
+                        let mut reaction_target = None;
+                        let mut group_scan_index = update_index;
+                        let mut group_parse_failed = false;
+
+                        while group_scan_index < results.len() {
+                            let group_update = &results[group_scan_index];
+                            if Self::extract_media_group_id(group_update) != Some(media_group_id) {
+                                break;
+                            }
+
+                            if let Some(uid) = group_update
+                                .get("update_id")
+                                .and_then(serde_json::Value::as_i64)
+                            {
+                                offset = uid + 1;
+                            }
+
+                            if reaction_target.is_none() {
+                                reaction_target = Self::extract_update_message_target(group_update);
+                            }
+
+                            if let Some(msg) = self.try_parse_attachment_message(group_update).await
+                            {
+                                grouped_messages.push(msg);
+                            } else {
+                                group_parse_failed = true;
+                                // Keep established behavior for unhandled updates:
+                                // this helper no-ops for non-text/non-unauthorized
+                                // cases, and emits guidance for unauthorized senders.
+                                self.handle_unauthorized_message(group_update).await;
+                                group_scan_index += 1;
+                                // Short-circuit attachment parsing for the rest of this
+                                // media_group_id; the outer branch then skips
+                                // dispatch for this whole group.
+                                while group_scan_index < results.len() {
+                                    let next_update = &results[group_scan_index];
+                                    if Self::extract_media_group_id(next_update)
+                                        != Some(media_group_id)
+                                    {
+                                        break;
+                                    }
+                                    if let Some(uid) = next_update
+                                        .get("update_id")
+                                        .and_then(serde_json::Value::as_i64)
+                                    {
+                                        offset = uid + 1;
+                                    }
+                                    group_scan_index += 1;
+                                }
+                                break;
+                            }
+
+                            group_scan_index += 1;
+                        }
+
+                        update_index = group_scan_index;
+
+                        if group_parse_failed {
+                            tracing::warn!(
+                                media_group_id,
+                                "Skipping Telegram media group due to at least one unparseable attachment update"
+                            );
+                            continue;
+                        }
+
+                        let Some(msg) =
+                            Self::merge_media_group_messages(media_group_id, grouped_messages)
+                        else {
+                            tracing::warn!(
+                                media_group_id,
+                                "Skipping Telegram media group: no mergeable attachment content"
+                            );
+                            continue;
+                        };
+
+                        if self.ack_reactions {
+                            if let Some((reaction_chat_id, reaction_message_id)) = reaction_target {
+                                self.try_add_ack_reaction_nonblocking(
+                                    reaction_chat_id,
+                                    reaction_message_id,
+                                );
+                            }
+                        }
+
+                        // Send "typing" indicator immediately when we receive a message
+                        let typing_body = serde_json::json!({
+                            "chat_id": &msg.reply_target,
+                            "action": "typing"
+                        });
+                        let _ = self
+                            .http_client()
+                            .post(self.api_url("sendChatAction"))
+                            .json(&typing_body)
+                            .send()
+                            .await; // Ignore errors for typing indicator
+
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+
                     // Advance offset past this update
                     if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
                     }
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
-                        m
+                        Some(m)
                     } else if let Some(m) = self.try_parse_voice_message(update).await {
-                        m
+                        Some(m)
                     } else if let Some(m) = self.try_parse_attachment_message(update).await {
-                        m
+                        Some(m)
                     } else {
                         Box::pin(self.handle_unauthorized_message(update)).await;
-                        continue;
+                        None
                     };
 
-                    if self.ack_reactions {
-                        if let Some((reaction_chat_id, reaction_message_id)) =
-                            Self::extract_update_message_target(update)
-                        {
-                            self.try_add_ack_reaction_nonblocking(
-                                reaction_chat_id,
-                                reaction_message_id,
-                            );
+                    if let Some(msg) = msg {
+                        if self.ack_reactions {
+                            if let Some((reaction_chat_id, reaction_message_id)) =
+                                Self::extract_update_message_target(update)
+                            {
+                                self.try_add_ack_reaction_nonblocking(
+                                    reaction_chat_id,
+                                    reaction_message_id,
+                                );
+                            }
+                        }
+
+                        // Send "typing" indicator immediately when we receive a message
+                        let typing_body = serde_json::json!({
+                            "chat_id": &msg.reply_target,
+                            "action": "typing"
+                        });
+                        let _ = self
+                            .http_client()
+                            .post(self.api_url("sendChatAction"))
+                            .json(&typing_body)
+                            .send()
+                            .await; // Ignore errors for typing indicator
+
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
                         }
                     }
 
-                    // Send "typing" indicator immediately when we receive a message
-                    let typing_body = serde_json::json!({
-                        "chat_id": &msg.reply_target,
-                        "action": "typing"
-                    });
-                    let _ = self
-                        .http_client()
-                        .post(self.api_url("sendChatAction"))
-                        .json(&typing_body)
-                        .send()
-                        .await; // Ignore errors for typing indicator
-
-                    if tx.send(msg).await.is_err() {
-                        return Ok(());
-                    }
+                    update_index += 1;
                 }
             }
         }
@@ -3052,6 +3316,84 @@ mod tests {
 
         let target = TelegramChannel::extract_update_message_target(&update);
         assert_eq!(target, Some(("-100123456".to_string(), 99)));
+    }
+
+    #[test]
+    fn telegram_extract_media_group_id_parses_value() {
+        let update = serde_json::json!({
+            "update_id": 12,
+            "message": {
+                "media_group_id": "album-123"
+            }
+        });
+
+        assert_eq!(
+            TelegramChannel::extract_media_group_id(&update),
+            Some("album-123")
+        );
+    }
+
+    #[test]
+    fn telegram_merge_media_group_messages_combines_attachment_contents() {
+        let msg = |id: &str, content: &str| ChannelMessage {
+            id: id.to_string(),
+            sender: "alice".to_string(),
+            reply_target: "-1001".to_string(),
+            content: content.to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        let merged = TelegramChannel::merge_media_group_messages(
+            "album-xyz",
+            vec![
+                msg(
+                    "telegram_-1001_10",
+                    "[IMAGE:/tmp/workspace/photo_1.jpg]\n\nFirst caption",
+                ),
+                msg("telegram_-1001_11", "[IMAGE:/tmp/workspace/photo_2.jpg]"),
+            ],
+        )
+        .expect("expected merged media group message");
+
+        assert!(merged.id.ends_with(":group:album-xyz"));
+        assert_eq!(
+            merged.content,
+            "[IMAGE:/tmp/workspace/photo_1.jpg]\n\nFirst caption\n\n[IMAGE:/tmp/workspace/photo_2.jpg]"
+        );
+    }
+
+    #[test]
+    fn telegram_merge_media_group_messages_without_caption_keeps_all_images() {
+        let msg = |id: &str, content: &str| ChannelMessage {
+            id: id.to_string(),
+            sender: "alice".to_string(),
+            reply_target: "-1001".to_string(),
+            content: content.to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        let merged = TelegramChannel::merge_media_group_messages(
+            "album-abc",
+            vec![
+                msg("telegram_-1001_10", "[IMAGE:/tmp/workspace/photo_1.jpg]"),
+                msg("telegram_-1001_11", "[IMAGE:/tmp/workspace/photo_2.jpg]"),
+            ],
+        )
+        .expect("expected merged media group message");
+
+        assert!(merged.id.ends_with(":group:album-abc"));
+        assert_eq!(
+            merged.content,
+            "[IMAGE:/tmp/workspace/photo_1.jpg]\n\n[IMAGE:/tmp/workspace/photo_2.jpg]"
+        );
     }
 
     #[test]
@@ -3426,6 +3768,103 @@ mod tests {
         assert_eq!(msg.reply_target, "-100200300:789");
         assert_eq!(msg.content, "hello from topic");
         assert_eq!(msg.id, "telegram_-100200300_42");
+    }
+
+    #[test]
+    fn extract_embedded_image_urls_reads_text_and_entities() {
+        let message = serde_json::json!({
+            "text": "See https://example.com/cat.png and docs",
+            "entities": [
+                {
+                    "type": "text_link",
+                    "offset": 0,
+                    "length": 4,
+                    "url": "https://example.com/hidden.jpg"
+                },
+                {
+                    "type": "text_link",
+                    "offset": 5,
+                    "length": 4,
+                    "url": "https://example.com/file.pdf"
+                }
+            ],
+            "link_preview_options": {
+                "url": "https://example.com/preview.webp"
+            }
+        });
+
+        let urls = TelegramChannel::extract_embedded_image_urls(
+            &message,
+            message["text"].as_str().unwrap(),
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/hidden.jpg".to_string(),
+                "https://example.com/preview.webp".to_string(),
+                "https://example.com/cat.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_embedded_image_urls_reads_caption_entities() {
+        let message = serde_json::json!({
+            "caption": "photo link",
+            "caption_entities": [{
+                "type": "text_link",
+                "offset": 0,
+                "length": 5,
+                "url": "https://example.com/album-image.jpeg"
+            }]
+        });
+
+        let urls = TelegramChannel::extract_embedded_image_urls(
+            &message,
+            message["caption"].as_str().unwrap(),
+        );
+        assert_eq!(urls, vec!["https://example.com/album-image.jpeg"]);
+    }
+
+    #[test]
+    fn extract_embedded_image_urls_trims_trailing_period_from_text_url() {
+        let message = serde_json::json!({
+            "text": "Look at this image https://example.com/cat.png."
+        });
+
+        let urls = TelegramChannel::extract_embedded_image_urls(
+            &message,
+            message["text"].as_str().unwrap(),
+        );
+        assert_eq!(urls, vec!["https://example.com/cat.png"]);
+    }
+
+    #[test]
+    fn parse_update_message_appends_embedded_image_markers() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 321,
+            "message": {
+                "message_id": 54,
+                "text": "please review",
+                "entities": [{
+                    "type": "text_link",
+                    "offset": 0,
+                    "length": 6,
+                    "url": "https://example.com/diagram.png"
+                }],
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999, "type": "private" }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("message with text_link should parse");
+        assert_eq!(
+            msg.content,
+            "please review\n\n[IMAGE:https://example.com/diagram.png]"
+        );
     }
 
     // ── File sending API URL tests ──────────────────────────────────
